@@ -9,22 +9,17 @@ import httpx
 import asyncio
 import base64
 from typing import List, Dict, Any
-# Make sure to import find_dotenv
 from dotenv import load_dotenv, find_dotenv
 
 from integrations.integration_item import IntegrationItem
 from redis_client import add_key_value_redis, get_value_redis, delete_key_redis
 
 # --- Configuration ---
-# Explicitly find and load the .env file
+# Load secrets from the .env file at the project's root
 load_dotenv(find_dotenv())
 
 CLIENT_ID = os.getenv('HUBSPOT_CLIENT_ID')
 CLIENT_SECRET = os.getenv('HUBSPOT_CLIENT_SECRET')
-
-# Add this temporary line for debugging:
-print(f"--- DEBUG --- Loaded Client ID is: {CLIENT_ID}")
-
 REDIRECT_URI = 'http://localhost:8000/integrations/hubspot/oauth2callback'
 SCOPE = 'crm.objects.contacts.read'
 AUTHORIZATION_URL = 'https://app.hubspot.com/oauth/authorize'
@@ -35,17 +30,15 @@ TOKEN_URL = 'https://api.hubapi.com/oauth/v1/token'
 
 async def authorize_hubspot(user_id: str, org_id: str) -> str:
     """
-    Creates the initial authorization URL to send the user to HubSpot for authentication.
-
-    This URL includes a secure state token to prevent CSRF attacks and specifies the
-    permissions (scopes) our application is requesting.
+    Generates the HubSpot OAuth authorization URL for the user.
+    A unique `state` token is created and stored in Redis to prevent CSRF attacks.
 
     Args:
         user_id: The ID of the user initiating the authorization.
         org_id: The ID of the organization for this user.
 
     Returns:
-        The fully constructed authorization URL for the frontend to redirect to.
+        The fully constructed authorization URL for the frontend.
     """
     state_data = {
         'state': secrets.token_urlsafe(32),
@@ -54,6 +47,7 @@ async def authorize_hubspot(user_id: str, org_id: str) -> str:
     }
     encoded_state = json.dumps(state_data)
 
+    # Store the state in Redis for 10 minutes to validate the callback
     await add_key_value_redis(f'hubspot_state:{org_id}:{user_id}', encoded_state, expire=600)
 
     auth_url = (
@@ -70,11 +64,8 @@ async def oauth2callback_hubspot(request: Request) -> HTMLResponse:
     """
     Handles the OAuth2 callback from HubSpot after user authorization.
 
-    It verifies the state token, exchanges the temporary authorization code
-    for a permanent access token, and stores the credentials securely.
-
     Args:
-        request: The incoming request object from FastAPI, containing query parameters.
+        request: The incoming request object from FastAPI, containing the auth code.
 
     Returns:
         An HTML response that closes the popup window upon success.
@@ -83,20 +74,18 @@ async def oauth2callback_hubspot(request: Request) -> HTMLResponse:
     encoded_state = request.query_params.get('state')
     
     if not code or not encoded_state:
-        raise HTTPException(status_code=400, detail="Missing code or state from HubSpot callback.")
+        raise HTTPException(status_code=400, detail="HubSpot callback is missing required parameters.")
 
     state_data = json.loads(encoded_state)
     user_id = state_data.get('user_id')
     org_id = state_data.get('org_id')
 
+    # Verify the state token to prevent CSRF attacks
     saved_state_str = await get_value_redis(f'hubspot_state:{org_id}:{user_id}')
-    if not saved_state_str:
-        raise HTTPException(status_code=400, detail="State has expired or is invalid.")
+    if not saved_state_str or json.loads(saved_state_str).get('state') != state_data.get('state'):
+        raise HTTPException(status_code=400, detail="State mismatch or expired. Authorization failed.")
 
-    saved_state_data = json.loads(saved_state_str)
-    if saved_state_data.get('state') != state_data.get('state'):
-        raise HTTPException(status_code=400, detail="State mismatch. CSRF attack may have been attempted.")
-
+    # Prepare the payload to exchange the authorization code for an access token
     payload = {
         'grant_type': 'authorization_code',
         'client_id': CLIENT_ID,
@@ -106,36 +95,38 @@ async def oauth2callback_hubspot(request: Request) -> HTMLResponse:
     }
     
     try:
+        # Make the server-to-server request to HubSpot's token endpoint
         async with httpx.AsyncClient() as client:
             response = await client.post(TOKEN_URL, data=payload, headers={'Content-Type': 'application/x-www-form-urlencoded'})
-        
-        response.raise_for_status()
+        response.raise_for_status() # Raise an exception for non-2xx responses
 
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: Could not connect to HubSpot to exchange token. {e}")
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Service Unavailable: Could not connect to HubSpot.")
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"HubSpot API error: {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"HubSpot API Error: {e.response.text}")
 
+    # Store the newly obtained credentials in Redis temporarily
     credentials = response.json()
     await add_key_value_redis(f'hubspot_credentials:{org_id}:{user_id}', json.dumps(credentials), expire=3600)
+    
+    # Clean up the used state token
     await delete_key_redis(f'hubspot_state:{org_id}:{user_id}')
     
+    # Return a simple HTML page that closes the popup window
     return HTMLResponse(content="<html><script>window.close();</script></html>")
 
 
 async def get_hubspot_credentials(user_id: str, org_id: str) -> Dict[str, Any]:
     """
-    Retrieves the stored HubSpot credentials for a user from Redis.
-
-    This is a single-use retrieval; the credentials are deleted from Redis
-    after being fetched to ensure they are only held temporarily.
+    Retrieves HubSpot credentials from Redis for a given user/org.
+    This is a single-use function that deletes the credentials after retrieval.
 
     Args:
         user_id: The ID of the user.
         org_id: The ID of the organization.
 
     Returns:
-        A dictionary containing the OAuth credentials (access_token, etc.).
+        A dictionary containing the OAuth credentials.
     """
     credentials_str = await get_value_redis(f'hubspot_credentials:{org_id}:{user_id}')
     if not credentials_str:
@@ -147,11 +138,12 @@ async def get_hubspot_credentials(user_id: str, org_id: str) -> Dict[str, Any]:
     return credentials
 
 
-# --- Data Loading and Transformation Functions ---
+# --- Data Loading and Transformation ---
 
 def _hubspot_contact_to_integration_item(contact_data: dict) -> IntegrationItem:
     """
-    Transforms a raw HubSpot contact object into a standardized IntegrationItem.
+    Maps a single HubSpot contact object to the standardized IntegrationItem schema.
+    Handles cases where contact names may be missing by providing a default name.
 
     Args:
         contact_data: The JSON dictionary for a single contact from the HubSpot API.
@@ -163,9 +155,8 @@ def _hubspot_contact_to_integration_item(contact_data: dict) -> IntegrationItem:
     first_name = properties.get('firstname', '')
     last_name = properties.get('lastname', '')
     
-    full_name = f"{first_name} {last_name}".strip()
-    if not full_name:
-        full_name = "Untitled Contact"
+    # Combine names and provide a fallback for contacts with no name
+    full_name = f"{first_name} {last_name}".strip() or "Untitled Contact"
 
     return IntegrationItem(
         id=contact_data.get('id'),
@@ -178,7 +169,8 @@ def _hubspot_contact_to_integration_item(contact_data: dict) -> IntegrationItem:
 
 async def get_items_hubspot(credentials: str) -> List[IntegrationItem]:
     """
-    Fetches a list of contacts from HubSpot using the provided credentials.
+    Fetches the first page of contacts from the HubSpot CRM API using an access token.
+    Transforms each contact into a standardized IntegrationItem object.
 
     Args:
         credentials: A JSON string containing the OAuth credentials.
@@ -195,24 +187,20 @@ async def get_items_hubspot(credentials: str) -> List[IntegrationItem]:
     headers = {'Authorization': f'Bearer {access_token}'}
     contacts_url = 'https://api.hubapi.com/crm/v3/objects/contacts'
     
-    list_of_integration_items = []
-    
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(contacts_url, headers=headers)
-        
         response.raise_for_status()
-
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: Could not connect to HubSpot to fetch items. {e}")
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Service Unavailable: Could not connect to HubSpot to fetch items.")
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"HubSpot API error: {e.response.text}")
+        # Pass along the specific error from HubSpot's API
+        raise HTTPException(status_code=e.response.status_code, detail=f"HubSpot API Error: {e.response.text}")
 
     results = response.json().get('results', [])
-    for item_json in results:
-        integration_item = _hubspot_contact_to_integration_item(item_json)
-        list_of_integration_items.append(integration_item)
+    list_of_integration_items = [_hubspot_contact_to_integration_item(item) for item in results]
     
+    # For demonstration, print the fetched items to the backend console
     print(f"Fetched HubSpot Items: {[item.__dict__ for item in list_of_integration_items]}")
     
     return list_of_integration_items

@@ -1,18 +1,30 @@
 // frontend/src/integrations/hubspot.js
+// HubSpot Integration Component: Handles the OAuth connection flow.
 
 import { useState, useEffect } from 'react';
-import {
-    Box,
-    Button,
-    CircularProgress
-} from '@mui/material';
+import { Box, Button, CircularProgress } from '@mui/material';
 import axios from 'axios';
 
+/**
+ * A React component that renders a button to handle the HubSpot OAuth 2.0 flow.
+ * @param {object} props - The component props.
+ * @param {string} props.user - The current user's ID, used for state management.
+ * @param {string} props.org - The current organization's ID, used for state management.
+ * @param {object} props.integrationParams - An object holding integration-specific data.
+ * @param {function} props.setIntegrationParams - A state setter to update the parent form's data.
+ */
 export const HubspotIntegration = ({ user, org, integrationParams, setIntegrationParams }) => {
+    // Manages if the integration is currently connected (i.e., if valid credentials exist).
     const [isConnected, setIsConnected] = useState(false);
+    // Manages the loading spinner state while the OAuth popup is open.
     const [isConnecting, setIsConnecting] = useState(false);
 
-    // This function is called when the 'Connect' button is clicked
+    /**
+     * Initiates the HubSpot OAuth flow when the user clicks "Connect".
+     * 1. Calls the backend to get a unique authorization URL.
+     * 2. Opens that URL in a popup window for the user to approve permissions.
+     * 3. Sets up an interval to check when the popup window is closed.
+     */
     const handleConnectClick = async () => {
         try {
             setIsConnecting(true);
@@ -20,68 +32,66 @@ export const HubspotIntegration = ({ user, org, integrationParams, setIntegratio
             formData.append('user_id', user);
             formData.append('org_id', org);
             
-            // 1. Call our backend's /authorize endpoint
             const response = await axios.post(`http://localhost:8000/integrations/hubspot/authorize`, formData);
             const authURL = response?.data;
 
-            // 2. Open the authorization URL from the backend in a popup window
             const newWindow = window.open(authURL, 'HubSpot Authorization', 'width=600, height=800');
 
-            // 3. Check every 200ms to see if the popup window has been closed
             const pollTimer = window.setInterval(() => {
-                if (newWindow?.closed !== false) { 
+                if (newWindow?.closed) { 
                     window.clearInterval(pollTimer);
-                    handleWindowClosed(); // If it's closed, check if we got the credentials
+                    handleWindowClosed();
                 }
             }, 200);
         } catch (e) {
             setIsConnecting(false);
-            alert(e?.response?.data?.detail);
+            alert(e?.response?.data?.detail || 'An unknown error occurred.');
         }
     }
 
-    // This function runs after the popup window is closed
+    /**
+     * Called after the OAuth popup window is closed.
+     * This function checks the backend to see if credentials were successfully created
+     * during the OAuth flow and updates the component's state accordingly.
+     */
     const handleWindowClosed = async () => {
         try {
             const formData = new FormData();
             formData.append('user_id', user);
             formData.append('org_id', org);
 
-            // 4. Call our backend's /credentials endpoint to get the token
             const response = await axios.post(`http://localhost:8000/integrations/hubspot/credentials`, formData);
             const credentials = response.data; 
             
-            // 5. If we successfully got credentials, update the UI to a "Connected" state
             if (credentials) {
-                setIsConnecting(false);
                 setIsConnected(true);
-                setIntegrationParams(prev => ({ ...prev, credentials: credentials, type: 'HubSpot' }));
-            } else {
-                setIsConnecting(false);
+                setIntegrationParams(prev => ({ ...prev, credentials, type: 'HubSpot' }));
             }
         } catch (e) {
+            // This error is expected if the user closes the popup without completing authentication.
+            console.log("Authentication flow was not completed.");
+        } finally {
             setIsConnecting(false);
-            // This is expected if the user closes the window without finishing
-            console.log("Auth not completed.");
         }
     }
 
+    // On initial render, check if HubSpot credentials already exist and set the button state.
     useEffect(() => {
-        setIsConnected(integrationParams?.credentials && integrationParams?.type === 'HubSpot' ? true : false);
+        const hasCredentials = integrationParams?.credentials && integrationParams?.type === 'HubSpot';
+        setIsConnected(hasCredentials);
     }, [integrationParams]);
 
     return (
-        <>
-        <Box sx={{mt: 2}}>
+        <Box sx={{mt: 2, width: 300}}>
             Parameters
             <Box display='flex' alignItems='center' justifyContent='center' sx={{mt: 2}}>
                 <Button 
                     variant='contained' 
-                    onClick={isConnected ? () => {} : handleConnectClick}
+                    onClick={isConnected ? undefined : handleConnectClick}
                     color={isConnected ? 'success' : 'primary'}
                     disabled={isConnecting}
+                    fullWidth
                     style={{
-                        pointerEvents: isConnected ? 'none' : 'auto',
                         cursor: isConnected ? 'default' : 'pointer',
                     }}
                 >
@@ -89,6 +99,5 @@ export const HubspotIntegration = ({ user, org, integrationParams, setIntegratio
                 </Button>
             </Box>
         </Box>
-      </>
     );
 }
